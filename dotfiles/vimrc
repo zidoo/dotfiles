@@ -53,7 +53,7 @@ au BufNewFile,BufRead *.py
     \ set textwidth=79 |
     \ set expandtab |
     \ set autoindent |
-    \ set fileformat=unix
+    \ set fileformat=unix |
     \ set colorcolumn=80
 
 
@@ -68,7 +68,7 @@ endfunction
 
 " Plugins
 Plugin 'VundleVim/Vundle.vim'
-Plugin 'davidhalter/jedi-vim'
+" Plugin 'davidhalter/jedi-vim'
 Plugin 'mattn/emmet-vim'
 Plugin 'rust-lang/rust.vim'
 Plugin 'tpope/vim-fugitive'

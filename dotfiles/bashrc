@@ -1,0 +1,45 @@
+# bashrc - Bash configuration
+
+# If not running interactively, don't do anything
+[[ $- != *i* ]] && return
+
+# Basic settings
+export EDITOR=vim
+export VISUAL=vim
+
+# History settings
+HISTSIZE=10000
+HISTFILESIZE=20000
+HISTCONTROL=ignoreboth:erasedups
+shopt -s histappend
+
+# Prevent history sharing in tmux - each pane keeps its own in-memory history
+if [[ -n "$TMUX" ]]; then
+    # Don't reload history from file on each prompt
+    unset HISTFILE
+fi
+
+# Aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias grep='grep --color=auto'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# Tmux aliases
+alias ta='tmux attach -t'
+alias tl='tmux list-sessions'
+alias tn='tmux new-session -s'
+
+# Prompt
+PS1='[\u@\h \W]\$ '
+
+# Enable bash completion
+if [ -f /etc/bash_completion ]; then
+    . /etc/bash_completion
+fi
+
+# FZF integration if available
+[ -f ~/.fzf.bash ] && source ~/.fzf.bash

@@ -1,0 +1,63 @@
+# zshrc - Zsh configuration
+
+# Basic settings
+export EDITOR=vim
+export VISUAL=vim
+export LANG=en_US.UTF-8
+
+# History settings
+HISTSIZE=10000
+SAVEHIST=20000
+setopt EXTENDED_HISTORY
+setopt HIST_EXPIRE_DUPS_FIRST
+setopt HIST_IGNORE_DUPS
+setopt HIST_IGNORE_SPACE
+setopt HIST_VERIFY
+
+# Prevent history sharing in tmux
+if [[ -n "$TMUX" ]]; then
+    # Disable history sharing between panes/windows
+    setopt NO_SHARE_HISTORY
+    setopt APPEND_HISTORY
+else
+    # Enable history sharing when not in tmux
+    setopt SHARE_HISTORY
+fi
+
+# Key bindings
+bindkey -e  # Emacs key bindings
+bindkey '^R' history-incremental-search-backward
+
+# Completion (only if not using oh-my-zsh)
+if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
+    autoload -Uz compinit
+    compinit
+    
+    # Prompt (only set if not using oh-my-zsh)
+    autoload -Uz promptinit
+    promptinit
+    PROMPT='%F{green}%n@%m%f:%F{blue}%~%f$ '
+fi
+
+# Aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias grep='grep --color=auto'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# Tmux aliases
+alias ta='tmux attach -t'
+alias tl='tmux list-sessions'
+alias tn='tmux new-session -s'
+
+# Path additions
+export PATH="$HOME/.local/bin:$PATH"
+
+# FZF integration if available
+[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
+
+# Load local config if exists
+[ -f ~/.zshrc.local ] && source ~/.zshrc.local
