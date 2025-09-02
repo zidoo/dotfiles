@@ -302,17 +302,29 @@ def find_instance_by_name(name_pattern, region=None, access_key=None,
     # Get all instances (use cache if available)
     instances = list_ec2_instances(region, access_key, secret_key)
     
-    # First try exact match
-    exact_matches = [i for i in instances 
-                     if i['name'].lower() == name_pattern.lower()]
-    if exact_matches:
-        return exact_matches
+    # Check if pattern contains wildcards
+    has_wildcards = '*' in name_pattern or '?' in name_pattern
     
-    # Then try partial match
-    partial_matches = [i for i in instances 
-                      if name_pattern.lower() in i['name'].lower()]
-    
-    return partial_matches
+    if has_wildcards:
+        # Use wildcard matching
+        matches = []
+        for instance in instances:
+            instance_name = instance.get('name', 'N/A')
+            if fnmatch.fnmatch(instance_name.lower(), name_pattern.lower()):
+                matches.append(instance)
+        return matches
+    else:
+        # First try exact match
+        exact_matches = [i for i in instances 
+                         if i['name'].lower() == name_pattern.lower()]
+        if exact_matches:
+            return exact_matches
+        
+        # Then try partial match (contains)
+        partial_matches = [i for i in instances 
+                          if name_pattern.lower() in i['name'].lower()]
+        
+        return partial_matches
 
 
 def is_tmux_session():
@@ -779,33 +791,95 @@ def main():
             print(f"Error: No instance found matching '{args.name_pattern}'")
             sys.exit(1)
         
+        # Handle multiple matches
         if len(matches) > 1:
-            print(f"Error: Multiple instances match '{args.name_pattern}':")
+            print(f"Found {len(matches)} instances matching '{args.name_pattern}':")
+            running_instances = []
+            non_running_instances = []
+            
             for inst in matches:
-                print(f"  - {inst['name']} ({inst['id']}) - {inst['status']}")
-            print("\nPlease be more specific.")
-            sys.exit(1)
-        
-        # Single match found
-        instance = matches[0]
-        
-        # Check if instance is running
-        if instance['status'] != 'running':
-            print(f"Warning: Instance {instance['name']} is {instance['status']}")
-            response = input("Continue anyway? (y/N): ")
-            if response.lower() != 'y':
-                sys.exit(0)
-        
-        # Determine tmux usage
-        use_tmux = None
-        if args.tmux:
+                status_color = ""
+                if inst['status'] == 'running':
+                    status_color = "\033[92m"  # Green
+                    running_instances.append(inst)
+                elif inst['status'] == 'stopped':
+                    status_color = "\033[91m"  # Red
+                    non_running_instances.append(inst)
+                else:
+                    status_color = "\033[90m"  # Gray
+                    non_running_instances.append(inst)
+                
+                print(f"  - {inst['name']} ({inst['id']}) - {status_color}{inst['status']}\033[0m")
+            
+            # If all instances are running, auto-connect without prompting
+            if len(running_instances) == len(matches) and len(running_instances) > 0:
+                print(f"All {len(running_instances)} instances are running. Connecting...")
+                instances_to_connect = running_instances
+            else:
+                # Ask user what to do with multiple matches
+                print(f"\nOptions:")
+                print(f"  1. Connect to all {len(running_instances)} running instances")
+                print(f"  2. Connect to all {len(matches)} instances (including non-running)")
+                print(f"  3. Cancel")
+                
+                choice = input("Choose option (1-3): ").strip()
+                
+                if choice == '1':
+                    if not running_instances:
+                        print("No running instances found.")
+                        sys.exit(1)
+                    instances_to_connect = running_instances
+                elif choice == '2':
+                    instances_to_connect = matches
+                else:
+                    print("Cancelled.")
+                    sys.exit(0)
+            
+            # Connect to multiple instances
+            print(f"\nConnecting to {len(instances_to_connect)} instances...")
+            
+            # Force tmux for multiple connections
             use_tmux = True
-        elif args.no_tmux:
-            use_tmux = False
-        
-        # SSH to the instance
-        ssh_to_instance(instance, user=args.user, key_file=args.key,
-                       port=args.port, use_tmux=use_tmux)
+            if not is_tmux_session() and not args.tmux:
+                print("Warning: Not in tmux session. Multiple SSH sessions work best in tmux.")
+                response = input("Continue anyway? (y/N): ")
+                if response.lower() != 'y':
+                    sys.exit(0)
+            
+            # Connect to each instance
+            success_count = 0
+            for instance in instances_to_connect:
+                print(f"Opening SSH to {instance['name']}...")
+                result = ssh_to_instance(instance, user=args.user, key_file=args.key,
+                                       port=args.port, use_tmux=use_tmux)
+                if result:
+                    success_count += 1
+                else:
+                    print(f"Failed to connect to {instance['name']}")
+            
+            print(f"\nSuccessfully opened {success_count}/{len(instances_to_connect)} SSH connections")
+            
+        else:
+            # Single match found
+            instance = matches[0]
+            
+            # Check if instance is running
+            if instance['status'] != 'running':
+                print(f"Warning: Instance {instance['name']} is {instance['status']}")
+                response = input("Continue anyway? (y/N): ")
+                if response.lower() != 'y':
+                    sys.exit(0)
+            
+            # Determine tmux usage
+            use_tmux = None
+            if args.tmux:
+                use_tmux = True
+            elif args.no_tmux:
+                use_tmux = False
+            
+            # SSH to the instance
+            ssh_to_instance(instance, user=args.user, key_file=args.key,
+                           port=args.port, use_tmux=use_tmux)
     
     elif args.command == 'showconfig':
         # Show configuration - no credentials check needed
