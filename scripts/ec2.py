@@ -14,6 +14,7 @@ import json
 import os
 import time
 import hashlib
+import subprocess
 from botocore.exceptions import ClientError, NoCredentialsError
 
 
@@ -102,7 +103,15 @@ def get_cache_filename(region, access_key=None, secret_key=None):
     """
     # Use default region if not specified
     if not region:
-        region = boto3.Session().region_name or 'default'
+        session = boto3.Session()
+        region = session.region_name
+        if not region:
+            # Try to get from EC2 client metadata
+            try:
+                ec2 = boto3.client('ec2')
+                region = ec2.meta.region_name
+            except:
+                region = 'default'
     
     # Create hash of credentials for uniqueness
     if access_key and secret_key:
@@ -120,7 +129,9 @@ def get_cache_filename(region, access_key=None, secret_key=None):
         else:
             cred_hash = 'nocreds'
     
-    return f"/tmp/ec2_cache_{region}_{cred_hash}.json"
+    # Include region in filename to ensure separate caches per region
+    safe_region = region.replace('-', '_')
+    return f"/tmp/ec2_cache_{safe_region}_{cred_hash}.json"
 
 
 def is_cache_valid(cache_file, ttl=300):
@@ -275,6 +286,315 @@ def filter_instances_by_name(instances, name_pattern):
     return filtered_instances
 
 
+def find_instance_by_name(name_pattern, region=None, access_key=None,
+                         secret_key=None):
+    """Find instance(s) by name pattern.
+    
+    Args:
+        name_pattern: Name or partial name of instance
+        region: AWS region
+        access_key: AWS Access Key ID (optional)
+        secret_key: AWS Secret Access Key (optional)
+    
+    Returns:
+        List of matching instances
+    """
+    # Get all instances (use cache if available)
+    instances = list_ec2_instances(region, access_key, secret_key)
+    
+    # First try exact match
+    exact_matches = [i for i in instances 
+                     if i['name'].lower() == name_pattern.lower()]
+    if exact_matches:
+        return exact_matches
+    
+    # Then try partial match
+    partial_matches = [i for i in instances 
+                      if name_pattern.lower() in i['name'].lower()]
+    
+    return partial_matches
+
+
+def is_tmux_session():
+    """Check if running inside tmux session.
+    
+    Returns:
+        True if inside tmux, False otherwise
+    """
+    return os.environ.get('TMUX') is not None
+
+
+def get_ssh_credentials():
+    """Get SSH credentials from environment variables.
+    
+    Returns:
+        List of (username, key_file) tuples to try
+    """
+    env_users = os.environ.get('EC2_USERNAME', '').strip()
+    env_keys = os.environ.get('EC2_SSHKEY', '').strip()
+    
+    if not env_users:
+        return []
+    
+    # Parse usernames and keys
+    usernames = [u.strip() for u in env_users.split(',') if u.strip()]
+    keyfiles = [k.strip() for k in env_keys.split(',') if k.strip()] if env_keys else [None]
+    
+    # Create all combinations: first user with all keys, then second user with all keys, etc.
+    combinations = []
+    for username in usernames:
+        for keyfile in keyfiles:
+            combinations.append((username, keyfile))
+    
+    return combinations
+
+
+def guess_ssh_user(instance):
+    """Guess SSH user based on instance name.
+    
+    Args:
+        instance: Instance dictionary
+    
+    Returns:
+        Guessed username
+    """
+    instance_name = instance['name'].lower()
+    if 'ubuntu' in instance_name:
+        return 'ubuntu'
+    elif 'centos' in instance_name:
+        return 'centos'
+    elif 'debian' in instance_name:
+        return 'admin'
+    else:
+        return 'ec2-user'  # Amazon Linux default
+
+
+def ssh_to_instance(instance, user=None, key_file=None, port=22,
+                    ssh_opts="", use_tmux=None):
+    """SSH to an EC2 instance.
+    
+    Args:
+        instance: Instance dictionary
+        user: SSH user (optional, will use env vars or guess)
+        key_file: Path to SSH key file (optional, will use env vars)
+        port: SSH port (default 22)
+        ssh_opts: Additional SSH options
+        use_tmux: Force tmux usage (None=auto, True=force, False=disable)
+    """
+    # Prefer public IP, fallback to private
+    ip = instance['public_ip']
+    if ip == 'N/A':
+        ip = instance['private_ip']
+        if ip == 'N/A':
+            print(f"Error: No IP address found for {instance['name']}")
+            return False
+    
+    # Get credentials to try
+    ssh_attempts = []
+    
+    if user and key_file:
+        # User provided both user and key via command line
+        ssh_attempts.append((user, key_file))
+    elif user:
+        # User provided username only
+        ssh_attempts.append((user, key_file))
+    else:
+        # Try environment variables first
+        env_credentials = get_ssh_credentials()
+        ssh_attempts.extend(env_credentials)
+        
+        # If no env vars, fall back to guessing
+        if not env_credentials:
+            guessed_user = guess_ssh_user(instance)
+            ssh_attempts.append((guessed_user, key_file))
+    
+    # Try each credential combination
+    for attempt_user, attempt_key in ssh_attempts:
+        # Build SSH command
+        ssh_cmd = ['ssh']
+        
+        # Add verbose flag if EC2_SSH_VERBOSE is set
+        if os.environ.get('EC2_SSH_VERBOSE', '').lower() in ('1', 'true', 'yes', 'on'):
+            ssh_cmd.append('-v')
+        
+        # Add connection timeout and other useful options
+        ssh_cmd.extend(['-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=no'])
+        
+        if attempt_key and os.path.exists(attempt_key):
+            ssh_cmd.extend(['-i', attempt_key])
+        elif attempt_key:
+            print(f"Warning: SSH key not found: {attempt_key}")
+            continue
+        
+        if port != 22:
+            ssh_cmd.extend(['-p', str(port)])
+        
+        if ssh_opts:
+            ssh_cmd.extend(ssh_opts.split())
+        
+        ssh_cmd.append(f"{attempt_user}@{ip}")
+        
+        # Show what we're trying
+        key_info = f" with key {attempt_key}" if attempt_key else ""
+        verbose_info = " (verbose)" if os.environ.get('EC2_SSH_VERBOSE') else ""
+        print(f"Trying {attempt_user}@{ip}{key_info}{verbose_info}...")
+        
+        # Determine if we should use tmux
+        should_use_tmux = use_tmux if use_tmux is not None else is_tmux_session()
+        
+        if should_use_tmux:
+            # Create new tmux window that stays open after SSH session ends
+            window_name = instance['name'][:20]  # Limit window name length
+            # Use tmux new-window with shell command that keeps window open
+            escaped_cmd = ' '.join(f"'{arg}'" for arg in ssh_cmd)
+            tmux_cmd = f"tmux new-window -n '{window_name}' \"bash -c '{escaped_cmd}; echo; echo SSH session ended. Press Enter to close window.; read'\""
+            print(f"Opening SSH to {instance['name']} ({ip}) in new tmux window...")
+            subprocess.run(tmux_cmd, shell=True)
+            return True
+        else:
+            # Direct SSH - try this combination
+            print(f"Connecting to {instance['name']} ({ip})...")
+            result = subprocess.run(ssh_cmd)
+            
+            # If SSH was successful (exit code 0), we're done
+            if result.returncode == 0:
+                return True
+            
+            # If we have more attempts, continue trying
+            if ssh_attempts.index((attempt_user, attempt_key)) < len(ssh_attempts) - 1:
+                print(f"Connection failed with {attempt_user}, trying next credential...")
+                continue
+    
+    # All attempts failed
+    print(f"Error: Could not connect to {instance['name']} with any available credentials")
+    return False
+
+
+def show_configuration():
+    """Show AWS configuration and environment variables."""
+    print("=" * 50)
+    print("EC2 Configuration")
+    print("=" * 50)
+    
+    # AWS Configuration
+    print("\nAWS Configuration:")
+    print("-" * 20)
+    
+    session = boto3.Session()
+    credentials = session.get_credentials()
+    
+    if credentials:
+        # Mask sensitive information
+        access_key = credentials.access_key
+        if access_key:
+            masked_key = access_key[:4] + "*" * (len(access_key) - 8) + access_key[-4:]
+            print(f"Access Key ID:     {masked_key}")
+        else:
+            print("Access Key ID:     Not configured")
+        
+        secret_key = credentials.secret_key
+        if secret_key:
+            print(f"Secret Access Key: {'*' * len(secret_key[:4])}***{'*' * len(secret_key[-4:])}")
+        else:
+            print("Secret Access Key: Not configured")
+    else:
+        print("Access Key ID:     Not configured")
+        print("Secret Access Key: Not configured")
+    
+    # Region
+    region = session.region_name
+    if region:
+        print(f"Default Region:    {region}")
+    else:
+        try:
+            ec2 = boto3.client('ec2')
+            region = ec2.meta.region_name
+            if region:
+                print(f"Default Region:    {region} (from client)")
+            else:
+                print("Default Region:    Not configured")
+        except:
+            print("Default Region:    Not configured")
+    
+    # Profile
+    profile = session.profile_name
+    if profile and profile != 'default':
+        print(f"Profile:           {profile}")
+    else:
+        print("Profile:           default")
+    
+    # Environment Variables
+    print("\nEnvironment Variables:")
+    print("-" * 22)
+    
+    ec2_username = os.environ.get('EC2_USERNAME', '')
+    ec2_sshkey = os.environ.get('EC2_SSHKEY', '')
+    ec2_ssh_verbose = os.environ.get('EC2_SSH_VERBOSE', '')
+    
+    if ec2_username:
+        usernames = [u.strip() for u in ec2_username.split(',') if u.strip()]
+        print(f"EC2_USERNAME:      {', '.join(usernames)}")
+    else:
+        print("EC2_USERNAME:      Not set")
+    
+    if ec2_sshkey:
+        keyfiles = [k.strip() for k in ec2_sshkey.split(',') if k.strip()]
+        print("EC2_SSHKEY:")
+        for i, keyfile in enumerate(keyfiles, 1):
+            # Check if key file exists
+            expanded_path = os.path.expanduser(keyfile)
+            exists = os.path.exists(expanded_path)
+            status = "✓" if exists else "✗"
+            print(f"  {i}. {keyfile} {status}")
+    else:
+        print("EC2_SSHKEY:        Not set")
+    
+    if ec2_ssh_verbose:
+        verbose_enabled = ec2_ssh_verbose.lower() in ('1', 'true', 'yes', 'on')
+        status = "Enabled" if verbose_enabled else f"Set but disabled ({ec2_ssh_verbose})"
+        print(f"EC2_SSH_VERBOSE:   {status}")
+    else:
+        print("EC2_SSH_VERBOSE:   Not set")
+    
+    # SSH Credential Combinations
+    print("\nSSH Credential Combinations:")
+    print("-" * 28)
+    
+    env_credentials = get_ssh_credentials()
+    if env_credentials:
+        print("Will try these combinations in order:")
+        for i, (username, keyfile) in enumerate(env_credentials, 1):
+            key_display = keyfile if keyfile else "(no key file)"
+            print(f"  {i}. {username} + {key_display}")
+    else:
+        print("No environment credentials configured.")
+        print("Will use auto-detection based on instance names:")
+        print("  - ubuntu    (for instances with 'ubuntu' in name)")
+        print("  - centos    (for instances with 'centos' in name)")  
+        print("  - admin     (for instances with 'debian' in name)")
+        print("  - ec2-user  (default for other instances)")
+    
+    # AWS CLI Configuration Files
+    print("\nAWS CLI Configuration:")
+    print("-" * 22)
+    
+    aws_config_dir = os.path.expanduser('~/.aws')
+    config_file = os.path.join(aws_config_dir, 'config')
+    credentials_file = os.path.join(aws_config_dir, 'credentials')
+    
+    if os.path.exists(config_file):
+        print(f"Config file:       {config_file} ✓")
+    else:
+        print(f"Config file:       {config_file} ✗")
+    
+    if os.path.exists(credentials_file):
+        print(f"Credentials file:  {credentials_file} ✓")
+    else:
+        print(f"Credentials file:  {credentials_file} ✗")
+    
+    print("\n" + "=" * 50)
+
+
 def print_instances_table(instances):
     """Print instances in a formatted table.
 
@@ -341,13 +661,13 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='EC2 management tool',
-                                     usage='%(prog)s list [name_pattern] [options]')
+                                     usage='%(prog)s {list,ssh,showconfig} [options]')
     
     # Positional arguments
-    parser.add_argument('command', choices=['list'],
+    parser.add_argument('command', choices=['list', 'ssh', 'showconfig'],
                         help='Command to execute')
     parser.add_argument('name_pattern', nargs='?',
-                        help='Filter instances by name (supports wildcards like *mongo*)')
+                        help='For list: filter pattern, For ssh: instance name')
     
     # Optional arguments
     parser.add_argument('-r', '--region',
@@ -361,12 +681,27 @@ def main():
     parser.add_argument('--no-cache', action='store_true',
                         help='Force refresh, ignore cached data')
     
+    # SSH specific options
+    parser.add_argument('--user', '-u',
+                        help='SSH user (default: auto-detect)')
+    parser.add_argument('--key', '-i',
+                        help='Path to SSH private key')
+    parser.add_argument('--port', '-p', type=int, default=22,
+                        help='SSH port (default: 22)')
+    parser.add_argument('--format',
+                        help='Output format (names: for autocomplete)')
+    parser.add_argument('--tmux', action='store_true',
+                        help='Force open in tmux window')
+    parser.add_argument('--no-tmux', action='store_true',
+                        help='Disable tmux integration')
+    
     args = parser.parse_args()
     
-    # Check credentials if not provided via arguments
-    if not args.access_key or not args.secret_key:
-        if not check_aws_credentials(args.region):
-            sys.exit(1)
+    # Check credentials if not provided via arguments (skip for showconfig)
+    if args.command != 'showconfig':
+        if not args.access_key or not args.secret_key:
+            if not check_aws_credentials(args.region):
+                sys.exit(1)
     
     # Handle list command
     if args.command == 'list':
@@ -396,7 +731,14 @@ def main():
                 if args.name_pattern:
                     print(f"Filtered by '{args.name_pattern}': "
                           f"{len(filtered_instances)} instances")
-                print_instances_table(filtered_instances)
+                
+                # Check for special format output
+                if args.format == 'names':
+                    # Output only instance names for autocomplete
+                    for inst in filtered_instances:
+                        print(inst['name'])
+                else:
+                    print_instances_table(filtered_instances)
                 
             except ClientError as e:
                 print(f"Error getting regions: {e}")
@@ -414,7 +756,60 @@ def main():
                 print(f"Filtered by '{args.name_pattern}': "
                       f"{len(filtered_instances)} of {len(instances)} instances")
             
-            print_instances_table(filtered_instances)
+            # Check for special format output
+            if args.format == 'names':
+                # Output only instance names for autocomplete
+                for inst in filtered_instances:
+                    print(inst['name'])
+            else:
+                print_instances_table(filtered_instances)
+    
+    elif args.command == 'ssh':
+        # SSH command requires instance name
+        if not args.name_pattern:
+            print("Error: Instance name required for ssh command")
+            print("Usage: ec2.py ssh <instance-name>")
+            sys.exit(1)
+        
+        # Find matching instances
+        matches = find_instance_by_name(args.name_pattern, args.region,
+                                       args.access_key, args.secret_key)
+        
+        if not matches:
+            print(f"Error: No instance found matching '{args.name_pattern}'")
+            sys.exit(1)
+        
+        if len(matches) > 1:
+            print(f"Error: Multiple instances match '{args.name_pattern}':")
+            for inst in matches:
+                print(f"  - {inst['name']} ({inst['id']}) - {inst['status']}")
+            print("\nPlease be more specific.")
+            sys.exit(1)
+        
+        # Single match found
+        instance = matches[0]
+        
+        # Check if instance is running
+        if instance['status'] != 'running':
+            print(f"Warning: Instance {instance['name']} is {instance['status']}")
+            response = input("Continue anyway? (y/N): ")
+            if response.lower() != 'y':
+                sys.exit(0)
+        
+        # Determine tmux usage
+        use_tmux = None
+        if args.tmux:
+            use_tmux = True
+        elif args.no_tmux:
+            use_tmux = False
+        
+        # SSH to the instance
+        ssh_to_instance(instance, user=args.user, key_file=args.key,
+                       port=args.port, use_tmux=use_tmux)
+    
+    elif args.command == 'showconfig':
+        # Show configuration - no credentials check needed
+        show_configuration()
 
 
 if __name__ == '__main__':
