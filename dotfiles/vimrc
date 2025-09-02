@@ -8,6 +8,7 @@ filetype indent on
 
 set autoread
 au FocusGained,BufEnter * checktime
+au CursorHold,CursorHoldI * checktime
 
 set ruler
 set cmdheight=1
