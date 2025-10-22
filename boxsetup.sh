@@ -373,7 +373,7 @@ install_packages() {
     done
 }
 
-# Backup existing configuration files
+# Backup existing configuration files before appending
 backup_configs() {
     local files=(".vimrc" ".tmux.conf" ".bashrc" ".zshrc" ".gitconfig")
     local backup_needed=false
@@ -390,7 +390,7 @@ backup_configs() {
         return
     fi
     
-    info "Backing up existing configuration files..."
+    info "Backing up existing configuration files before installation..."
     
     if [[ "${DRY_RUN}" == true ]]; then
         echo "[DRY RUN] Would create backup directory: ${BACKUP_DIR}"
@@ -417,42 +417,90 @@ clone_dotfiles() {
     return 0
 }
 
-# Create symlinks for dotfiles
-symlink_dotfiles() {
+# Detect current shell and install appropriate configurations
+detect_and_install_shell_config() {
+    local current_shell=$(basename "${SHELL}")
     local dotfiles_dir="${SCRIPT_DIR}/dotfiles"
-    local files_to_link=("vimrc" "tmux.conf" "bashrc" "zshrc" "gitconfig")
     
-    info "Creating symlinks for dotfiles..."
+    info "Detected current shell: ${current_shell}"
+    
+    case "${current_shell}" in
+        zsh)
+            if [[ -f "${dotfiles_dir}/zshrc" ]]; then
+                install_config_file "zshrc"
+            fi
+            ;;
+        bash)
+            if [[ -f "${dotfiles_dir}/bashrc" ]]; then
+                install_config_file "bashrc"
+            fi
+            ;;
+        *)
+            warning "Unknown shell: ${current_shell}, installing both bash and zsh configs"
+            [[ -f "${dotfiles_dir}/bashrc" ]] && install_config_file "bashrc"
+            [[ -f "${dotfiles_dir}/zshrc" ]] && install_config_file "zshrc"
+            ;;
+    esac
+}
+
+# Install a single configuration file
+install_config_file() {
+    local file="$1"
+    local dotfiles_dir="${SCRIPT_DIR}/dotfiles"
+    local source="${dotfiles_dir}/${file}"
+    local target="${HOME}/.${file}"
+    
+    if [[ ! -f "${source}" ]]; then
+        debug "Source file not found: ${source}"
+        return
+    fi
+    
+    if [[ "${DRY_RUN}" == true ]]; then
+        if [[ -f "${target}" ]]; then
+            echo "[DRY RUN] Would append ${source} to existing ${target}"
+        else
+            echo "[DRY RUN] Would copy ${source} to ${target}"
+        fi
+    else
+        if [[ -f "${target}" ]]; then
+            # Check if already contains our configuration
+            if grep -q "# Added by boxsetup.sh" "${target}" 2>/dev/null; then
+                info "Configuration already added to ${file}, skipping"
+                return
+            fi
+            
+            # Append to existing file
+            info "Appending ${file} to existing configuration"
+            echo "" >> "${target}"
+            echo "# Added by boxsetup.sh on $(date)" >> "${target}"
+            cat "${source}" >> "${target}"
+            info "Appended ${file} to existing configuration"
+        else
+            # Copy new file
+            cp "${source}" "${target}"
+            info "Installed ${file}"
+        fi
+    fi
+}
+
+# Copy dotfiles to their target locations
+copy_dotfiles() {
+    local dotfiles_dir="${SCRIPT_DIR}/dotfiles"
+    local files_to_copy=("vimrc" "tmux.conf" "gitconfig")
+    
+    info "Installing dotfiles..."
     
     # Check if dotfiles directory exists
     if [[ ! -d "${dotfiles_dir}" ]]; then
         error "Dotfiles directory not found: ${dotfiles_dir}"
     fi
     
-    for file in "${files_to_link[@]}"; do
-        local source="${dotfiles_dir}/${file}"
-        local target="${HOME}/.${file}"
-        
-        if [[ ! -f "${source}" ]]; then
-            debug "Source file not found: ${source}"
-            continue
-        fi
-        
-        if [[ -L "${target}" ]]; then
-            debug "Symlink already exists: ${target}"
-            continue
-        fi
-        
-        if [[ -f "${target}" ]]; then
-            warning "File exists: ${target} (backup created)"
-        fi
-        
-        if [[ "${DRY_RUN}" == true ]]; then
-            echo "[DRY RUN] Would create symlink: ${target} -> ${source}"
-        else
-            ln -sf "${source}" "${target}"
-            info "Created symlink: ${file}"
-        fi
+    # Install shell-specific configuration
+    detect_and_install_shell_config
+    
+    # Install other configuration files
+    for file in "${files_to_copy[@]}"; do
+        install_config_file "${file}"
     done
 }
 
@@ -486,7 +534,7 @@ install_dotfiles() {
     backup_configs
     clone_dotfiles
     install_vundle
-    symlink_dotfiles
+    copy_dotfiles
 }
 
 # Post-installation setup
@@ -499,8 +547,11 @@ post_install() {
             if [[ "${DRY_RUN}" == true ]]; then
                 echo "[DRY RUN] Would change shell to zsh"
             else
-                chsh -s "$(command -v zsh)"
-                info "Changed default shell to zsh"
+                if chsh -s "$(command -v zsh)" 2>/dev/null; then
+                    info "Changed default shell to zsh"
+                else
+                    warning "Could not change shell automatically. You may need to run: chsh -s $(command -v zsh)"
+                fi
             fi
         fi
     fi
